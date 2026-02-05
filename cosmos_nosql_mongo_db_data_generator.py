@@ -181,7 +181,14 @@ def insert_one_with_retry(collection, doc, logger):
             retry_after_ms = _get_retry_after_ms(e)
             base_wait = max(RETRY_SLEEP, (retry_after_ms / 1000.0) if retry_after_ms else 0)
             sleep_time = base_wait * (2 ** (retries - 1))
-            logger.warning(f"[Insert] Retry {retries}/{MAX_RETRIES} after error, waiting {sleep_time}s: {str(e)}")
+            if isinstance(e, errors.BulkWriteError) or _get_retry_after_ms(e):
+                logger.warning(
+                    f"[Insert] Retry {retries}/{MAX_RETRIES} after throttling, waiting {sleep_time}s"
+                )
+            else:
+                logger.warning(
+                    f"[Insert] Retry {retries}/{MAX_RETRIES} after error, waiting {sleep_time}s"
+                )
             time.sleep(sleep_time)
 
 
@@ -223,7 +230,14 @@ def insert_with_retry(collection, batch, logger):
             retry_after_ms = _get_retry_after_ms(e)
             base_wait = max(RETRY_SLEEP, (retry_after_ms / 1000.0) if retry_after_ms else 0)
             sleep_time = base_wait * (2 ** (retries - 1))
-            logger.warning(f"[Insert] Retry {retries}/{MAX_RETRIES} after error, waiting {sleep_time}s: {str(e)}")
+            if _get_retry_after_ms(e):
+                logger.warning(
+                    f"[Insert] Retry {retries}/{MAX_RETRIES} after throttling, waiting {sleep_time}s"
+                )
+            else:
+                logger.warning(
+                    f"[Insert] Retry {retries}/{MAX_RETRIES} after error, waiting {sleep_time}s"
+                )
             time.sleep(sleep_time)
 
 

@@ -445,8 +445,10 @@ def main():
 
     args = parser.parse_args()
 
-    # Set log file based on mode
-    log_file = f"cosmos_loader_{args.mode}.log"
+    # Set log file based on mode and endpoint prefix
+    endpoint_prefix = MONGO_ENDPOINT.split(".")[0].split(":")[0]
+    endpoint_prefix = re.sub(r"[^A-Za-z0-9_-]+", "_", endpoint_prefix) or "endpoint"
+    log_file = f"cosmos_loader_{args.mode}_{endpoint_prefix}.log"
     global logger
     logger = setup_logging(log_file)
 

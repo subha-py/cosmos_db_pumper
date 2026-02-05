@@ -83,8 +83,15 @@ def setup_logging(log_file, clear_file=True):
     logger.handlers.clear()
     
     # Add handlers
-    logger.addHandler(logging.FileHandler(log_file))
-    logger.addHandler(logging.StreamHandler(sys.stdout))
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    # Filter out WARNING messages from file handler
+    file_handler.addFilter(lambda record: record.levelno != logging.WARNING)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
     
     # Set format
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -174,21 +181,16 @@ def insert_one_with_retry(collection, doc, logger):
 
         except errors.PyMongoError as e:
             if retries >= MAX_RETRIES:
-                logger.error(f"[Insert] Single insert failed after {MAX_RETRIES} retries: {str(e)}")
+                logger.debug(f"[Insert] Single insert failed after {MAX_RETRIES} retries: {str(e)}")
                 return
 
             retries += 1
             retry_after_ms = _get_retry_after_ms(e)
             base_wait = max(RETRY_SLEEP, (retry_after_ms / 1000.0) if retry_after_ms else 0)
             sleep_time = base_wait * (2 ** (retries - 1))
-            if isinstance(e, errors.BulkWriteError) or _get_retry_after_ms(e):
-                logger.warning(
-                    f"[Insert] Retry {retries}/{MAX_RETRIES} after throttling, waiting {sleep_time}s"
-                )
-            else:
-                logger.warning(
-                    f"[Insert] Retry {retries}/{MAX_RETRIES} after error, waiting {sleep_time}s"
-                )
+            logger.debug(
+                f"[Insert] Retry {retries}/{MAX_RETRIES}, waiting {sleep_time}s"
+            )
             time.sleep(sleep_time)
 
 
@@ -211,7 +213,7 @@ def insert_with_retry(collection, batch, logger):
             if retry_after_ms:
                 time.sleep(retry_after_ms / 1000.0)
 
-            logger.warning(
+            logger.debug(
                 f"[Insert] BulkWriteError encountered; retrying {len(failed_docs)} failed docs individually"
             )
 
@@ -223,7 +225,7 @@ def insert_with_retry(collection, batch, logger):
         except errors.PyMongoError as e:
 
             if retries >= MAX_RETRIES:
-                logger.error(f"[Insert] Failed after {MAX_RETRIES} retries: {str(e)}")
+                logger.debug(f"[Insert] Failed after {MAX_RETRIES} retries: {str(e)}")
                 raise e
 
             retries += 1
@@ -231,11 +233,11 @@ def insert_with_retry(collection, batch, logger):
             base_wait = max(RETRY_SLEEP, (retry_after_ms / 1000.0) if retry_after_ms else 0)
             sleep_time = base_wait * (2 ** (retries - 1))
             if _get_retry_after_ms(e):
-                logger.warning(
+                logger.debug(
                     f"[Insert] Retry {retries}/{MAX_RETRIES} after throttling, waiting {sleep_time}s"
                 )
             else:
-                logger.warning(
+                logger.debug(
                     f"[Insert] Retry {retries}/{MAX_RETRIES} after error, waiting {sleep_time}s"
                 )
             time.sleep(sleep_time)

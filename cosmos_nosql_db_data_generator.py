@@ -79,8 +79,15 @@ def setup_logging(log_file, clear_file=True):
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    logger.addHandler(logging.FileHandler(log_file))
-    logger.addHandler(logging.StreamHandler(sys.stdout))
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    # Filter out WARNING messages from file handler
+    file_handler.addFilter(lambda record: record.levelno != logging.WARNING)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     for handler in logger.handlers:
@@ -151,19 +158,19 @@ def insert_one_with_retry(container, doc, logger):
         except exceptions.CosmosHttpResponseError as e:
             if e.status_code == 429:
                 if retries >= MAX_RETRIES:
-                    logger.error(f"[Insert] Throttled after {MAX_RETRIES} retries: {str(e)}")
+                    logger.debug(f"[Insert] Throttled after {MAX_RETRIES} retries: {str(e)}")
                     return
                 retries += 1
                 retry_after_ms = _get_retry_after_ms(e)
                 base_wait = max(RETRY_SLEEP, (retry_after_ms / 1000.0) if retry_after_ms else 0)
                 sleep_time = base_wait * (2 ** (retries - 1))
-                logger.warning(f"[Insert] 429 retry {retries}/{MAX_RETRIES}, waiting {sleep_time}s")
+                logger.debug(f"[Insert] 429 retry {retries}/{MAX_RETRIES}, waiting {sleep_time}s")
                 time.sleep(sleep_time)
                 continue
-            logger.error("[Insert] Failed")
+            logger.debug("[Insert] Failed")
             return
         except Exception as e:
-            logger.error("[Insert] Unexpected error")
+            logger.debug("[Insert] Unexpected error")
             return
 
 

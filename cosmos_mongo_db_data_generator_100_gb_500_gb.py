@@ -232,7 +232,7 @@ def insert_with_retry(collection, batch, logger):
 
 def load_collection_worker(args):
 
-    col_name, docs_target, doc_kb, avg_doc_bytes, threads, db_name, log_file = args
+    col_name, docs_target, doc_kb, avg_doc_bytes, threads, db_name, log_file, log_every_batches = args
     
     # Initialize logger in worker process
     logger = setup_logging(log_file, clear_file=False)
@@ -263,7 +263,7 @@ def load_collection_worker(args):
 
             if len(batch) >= dynamic_batch_size:
                 batch_count += 1
-                if batch_count == 1 or batch_count % LOG_EVERY_N_BATCHES == 0 or inserted + len(batch) >= end_idx:
+                if batch_count == 1 or batch_count % log_every_batches == 0 or inserted + len(batch) >= end_idx:
                     logger.info(
                         f"[{col_name}] Inserting batch #{batch_count} ({len(batch)} docs) - "
                         f"Progress: {inserted:,}/{docs_target:,} ({(inserted/docs_target)*100:.1f}%)"
@@ -489,6 +489,13 @@ def main():
             args.workers = min(args.workers, 2)
             args.threads = min(args.threads, 4)
 
+    # Reduce per-batch logging for large runs
+    log_every_batches = LOG_EVERY_N_BATCHES
+    if args.mode == "100gb":
+        log_every_batches = max(LOG_EVERY_N_BATCHES, 200)
+    elif args.mode == "500gb":
+        log_every_batches = max(LOG_EVERY_N_BATCHES, 500)
+
     logger.info("=" * 60)
     logger.info("Cosmos Advanced Parallel Loader")
     logger.info(f"Mode        : {args.mode}")
@@ -566,7 +573,7 @@ def main():
             expected_total_docs += existing_count + remaining_docs
 
             if remaining_docs > 0:
-                jobs.append((name, remaining_docs, doc_kb, avg_doc_bytes, args.threads, db_name, log_file))
+                jobs.append((name, remaining_docs, doc_kb, avg_doc_bytes, args.threads, db_name, log_file, log_every_batches))
 
         client.close()
 
@@ -576,17 +583,29 @@ def main():
     else:
         for i in range(1, collections + 1):
             name = f"{name_prefix}{i:04d}"
-            jobs.append((name, docs_target, doc_kb, avg_doc_bytes, args.threads, db_name, log_file))
+            jobs.append((name, docs_target, doc_kb, avg_doc_bytes, args.threads, db_name, log_file, log_every_batches))
     
     logger.info(f"\nPrepared {len(jobs)} collections for parallel processing")
     logger.info(f"Starting {args.workers} worker processes...")
     logger.info("\nStarting parallel load...")
 
     if jobs:
-        with mp.Pool(args.workers) as pool:
+        db_size_client = get_client()
+        db_size = db_size_client[db_name]
+        try:
+            with mp.Pool(args.workers) as pool:
 
-            for res in pool.imap_unordered(load_collection_worker, jobs):
-                logger.info(f"[✓] {res} completed")
+                for res in pool.imap_unordered(load_collection_worker, jobs):
+                    logger.info(f"[✓] {res} completed")
+                    if args.mode in ("100gb", "500gb"):
+                        try:
+                            stats = db_size.command("dbstats")
+                            size_gb = stats.get("dataSize", 0) / 1024**3
+                            logger.info(f"[DB] Current data size: {size_gb:.2f} GB")
+                        except errors.PyMongoError as e:
+                            logger.warning(f"[DB] Failed to fetch dbstats: {str(e)}")
+        finally:
+            db_size_client.close()
     else:
         logger.info("No remaining work to load.")
 

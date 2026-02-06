@@ -158,7 +158,7 @@ def insert_one_with_retry(container, doc, logger):
         except exceptions.CosmosHttpResponseError as e:
             if e.status_code == 429:
                 if retries >= MAX_RETRIES:
-                    logger.debug(f"[Insert] Throttled after {MAX_RETRIES} retries: {str(e)}")
+                    logger.warning(f"[Insert] Throttled after {MAX_RETRIES} retries, continuing: {str(e)}")
                     return
                 retries += 1
                 retry_after_ms = _get_retry_after_ms(e)
@@ -167,10 +167,10 @@ def insert_one_with_retry(container, doc, logger):
                 logger.debug(f"[Insert] 429 retry {retries}/{MAX_RETRIES}, waiting {sleep_time}s")
                 time.sleep(sleep_time)
                 continue
-            logger.debug("[Insert] Failed")
+            logger.error(f"[Insert] CosmosHttpResponseError (status {e.status_code}): {str(e)}")
             return
         except Exception as e:
-            logger.debug("[Insert] Unexpected error")
+            logger.error(f"[Insert] Unexpected error ({type(e).__name__}): {str(e)}")
             return
 
 
@@ -198,69 +198,90 @@ def load_collection_worker(args):
     logger = setup_logging(log_file, clear_file=False)
     logger.info(f"[Worker] Starting work on {container_name} - Target: {docs_target:,} docs")
 
-    client = get_client()
-    db, container = ensure_database_and_container(client, db_name, container_name, throughput)
-    logger.info(f"[Worker] Connected to database '{db_name}', accessing container '{container_name}'")
+    try:
+        client = get_client()
+        db, container = ensure_database_and_container(client, db_name, container_name, throughput)
+        logger.info(f"[Worker] Connected to database '{db_name}', accessing container '{container_name}'")
 
-    max_batch_bytes = COSMOS_BATCH_MAX_BYTES
-    dynamic_batch_size = max(1, min(BATCH_SIZE, max_batch_bytes // max(1, avg_doc_bytes)))
+        max_batch_bytes = COSMOS_BATCH_MAX_BYTES
+        dynamic_batch_size = max(1, min(BATCH_SIZE, max_batch_bytes // max(1, avg_doc_bytes)))
 
-    def thread_loader(start_idx, end_idx):
-        inserted = start_idx
-        batch = []
-        batch_count = 0
+        def thread_loader(start_idx, end_idx):
+            try:
+                inserted = start_idx
+                batch = []
+                batch_count = 0
 
-        while inserted < end_idx:
-            batch.append(generate_document(doc_kb))
+                while inserted < end_idx:
+                    batch.append(generate_document(doc_kb))
 
-            if len(batch) >= dynamic_batch_size:
-                batch_count += 1
-                if (
-                    batch_count == 1
-                    or batch_count % log_every_batches == 0
-                    or inserted + len(batch) >= end_idx
-                ):
+                    if len(batch) >= dynamic_batch_size:
+                        batch_count += 1
+                        if (
+                            batch_count == 1
+                            or batch_count % log_every_batches == 0
+                            or inserted + len(batch) >= end_idx
+                        ):
+                            logger.info(
+                                f"[{container_name}] Inserting batch #{batch_count} ({len(batch)} docs) - "
+                                f"Progress: {inserted:,}/{docs_target:,} ({(inserted/docs_target)*100:.1f}%)"
+                            )
+
+                        insert_with_retry(container, batch, logger)
+                        if COSMOS_THROTTLE_SLEEP > 0:
+                            time.sleep(COSMOS_THROTTLE_SLEEP)
+
+                        inserted += len(batch)
+                        batch.clear()
+
+                if batch:
+                    batch_count += 1
                     logger.info(
-                        f"[{container_name}] Inserting batch #{batch_count} ({len(batch)} docs) - "
-                        f"Progress: {inserted:,}/{docs_target:,} ({(inserted/docs_target)*100:.1f}%)"
+                        f"[{container_name}] Inserting final batch #{batch_count} ({len(batch)} docs) - Completing {container_name}"
                     )
+                    insert_with_retry(container, batch, logger)
+                    if COSMOS_THROTTLE_SLEEP > 0:
+                        time.sleep(COSMOS_THROTTLE_SLEEP)
+            except Exception as e:
+                logger.error(f"[Thread] Error in thread_loader for {container_name} (range {start_idx}-{end_idx}): {type(e).__name__}: {str(e)}")
+                raise
 
-                insert_with_retry(container, batch, logger)
-                if COSMOS_THROTTLE_SLEEP > 0:
-                    time.sleep(COSMOS_THROTTLE_SLEEP)
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = []
+            remaining = docs_target
+            chunk = (remaining // threads) + (1 if remaining % threads else 0)
 
-                inserted += len(batch)
-                batch.clear()
+            logger.info(f"[{container_name}] Spawning {threads} threads, each handling ~{chunk:,} docs")
 
-        if batch:
-            batch_count += 1
-            logger.info(
-                f"[{container_name}] Inserting final batch #{batch_count} ({len(batch)} docs) - Completing {container_name}"
-            )
-            insert_with_retry(container, batch, logger)
-            if COSMOS_THROTTLE_SLEEP > 0:
-                time.sleep(COSMOS_THROTTLE_SLEEP)
+            for i in range(threads):
+                start = i * chunk
+                end = min(start + chunk, docs_target)
+                if start < end:
+                    futures.append(executor.submit(thread_loader, start, end))
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = []
-        remaining = docs_target
-        chunk = (remaining // threads) + (1 if remaining % threads else 0)
+            for f in futures:
+                f.result()
 
-        logger.info(f"[{container_name}] Spawning {threads} threads, each handling ~{chunk:,} docs")
+        logger.info(f"[Worker] Completed {container_name} - Total docs: {docs_target:,}")
+        close_client(client)
 
-        for i in range(threads):
-            start = i * chunk
-            end = min(start + chunk, docs_target)
-            if start < end:
-                futures.append(executor.submit(thread_loader, start, end))
+        return container_name
 
-        for f in futures:
-            f.result()
-
-    logger.info(f"[Worker] Completed {container_name} - Total docs: {docs_target:,}")
-    close_client(client)
-
-    return container_name
+    except Exception as e:
+        # Catch all exceptions and convert to a serializable error message
+        # This prevents "cannot pickle 'traceback' object" errors in multiprocessing
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"[Worker] FAILED {container_name} - Error: {error_msg}")
+        
+        # Try to close the client if it was created
+        try:
+            if 'client' in locals():
+                close_client(client)
+        except:
+            pass
+        
+        # Re-raise as a simple Exception with just the message (no traceback)
+        raise Exception(f"Worker failed for {container_name}: {error_msg}")
 
 
 # ================= MONITOR =================
@@ -380,7 +401,7 @@ def main():
 
     elif args.mode == "100gb":
         total_gb = 100
-        containers = 100
+        containers = 25
         name_prefix = "collection_"
         if args.threads == DEFAULT_THREADS:
             args.threads = 8
@@ -494,21 +515,31 @@ def main():
         count_client = get_client()
         count_db = count_client.get_database_client(db_name)
         total_docs_logged = 0
+        failed_containers = []
         try:
             with mp.Pool(args.workers) as pool:
                 for res in pool.imap_unordered(load_collection_worker, jobs):
-                    logger.info(f"[✓] {res} completed")
-                    if args.mode in ("100gb", "500gb"):
-                        try:
-                            container = count_db.get_container_client(res)
-                            cnt = query_container_count(container)
-                            total_docs_logged += cnt
-                            est_gb = (total_docs_logged * avg_doc_bytes) / 1024**3
-                            logger.info(f"[DB] Current data size: ~{est_gb:.2f} GB (estimated)")
-                        except Exception as e:
-                            logger.warning(f"[DB] Failed to fetch count for {res}: {str(e)}")
+                    if res:
+                        logger.info(f"[✓] {res} completed")
+                        if args.mode in ("100gb", "500gb"):
+                            try:
+                                container = count_db.get_container_client(res)
+                                cnt = query_container_count(container)
+                                total_docs_logged += cnt
+                                est_gb = (total_docs_logged * avg_doc_bytes) / 1024**3
+                                logger.info(f"[DB] Current data size: ~{est_gb:.2f} GB (estimated)")
+                            except Exception as e:
+                                logger.warning(f"[DB] Failed to fetch count for {res}: {str(e)}")
+        except Exception as e:
+            logger.error(f"[Main] Worker pool error: {type(e).__name__}: {str(e)}")
+            failed_containers.append(str(e))
         finally:
             close_client(count_client)
+        
+        if failed_containers:
+            logger.error(f"\n[Main] {len(failed_containers)} container(s) failed to load:")
+            for err in failed_containers:
+                logger.error(f"  - {err}")
     else:
         logger.info("No remaining work to load.")
 
